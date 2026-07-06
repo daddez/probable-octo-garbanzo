@@ -47,7 +47,8 @@ YOLO_MODEL_DIR = os.path.join(NETWORK_VOL_DIR, "yolo")
 YOLO_PATH = os.path.join(YOLO_MODEL_DIR, "yolov8n.pt")
 
 COMFYUI_DIR = "/runpod-volume/runpod-slim/ComfyUI"
-PYTHON_EXECUTABLE = "python"
+VENV_PYTHON = "/runpod-volume/barberpro/venv/bin/python"
+PYTHON_EXECUTABLE = VENV_PYTHON if os.path.exists(VENV_PYTHON) else sys.executable
 COMFYUI_PORT = "8188"
 COMFYUI_URL = f"http://127.0.0.1:{COMFYUI_PORT}"
 
@@ -99,16 +100,6 @@ def start_comfyui():
         
     os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
     os.makedirs(LLM_DIR, exist_ok=True)
-    
-    # Installazione dinamica di emergenza (in caso di RunPod startup script o Docker vecchio)
-    try:
-        import alembic
-        import blake3
-    except ImportError:
-        write_log("Dipendenze base mancanti nel container! Avvio installazione dinamica (safe mode)...")
-        safe_packages = ["alembic", "blake3", "comfy-aimdo>=0.2.12", "comfy-kitchen>=0.2.8", "simpleeval>=1.0.0", "accelerate", "diffusers", "sageattention==1.0.6", "ftfy"]
-        subprocess.run([PYTHON_EXECUTABLE, "-m", "pip", "install"] + safe_packages, check=False)
-        write_log("Installazione dinamica completata.")
     
     log_file_path = "/tmp/comfyui_startup.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
