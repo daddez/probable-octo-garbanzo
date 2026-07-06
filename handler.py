@@ -537,10 +537,17 @@ def chiama_regista_locale(testo_narrativo):
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Trascrizione: {testo_narrativo}"}]
     outputs = pipe(messages, max_new_tokens=1024, do_sample=False)
     content = outputs[0]["generated_text"][-1]["content"].strip()
-    if content.startswith("```json"): content = content[7:]
-    if content.endswith("```"): content = content[:-3]
+    
+    # Estrai il blocco JSON usando una regex per evitare problemi se il LLM aggiunge testo prima o dopo
+    import re
+    match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+    else:
+        json_str = content # fallback
+        
     try:
-        data = json.loads(content.strip())
+        data = json.loads(json_str)
         if isinstance(data, dict):
              for key in data.keys():
                   if isinstance(data[key], list):
@@ -548,7 +555,8 @@ def chiama_regista_locale(testo_narrativo):
                        break
         # LLM tenuto in cache per lo sceneggiatore!
         return data
-    except Exception:
+    except Exception as e:
+        write_log(f"[Regista] Errore parsing JSON: {e}\nContenuto grezzo: {content}")
         return []
 
 def invia_webhook_errore(url, msg):
@@ -782,8 +790,12 @@ def process_video_workflow(job_input, job_id="default"):
 
     try:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        subprocess.run(["pycaps", "render", "--input", video_senza_testo, "--template", "hype", "--output", final_video], check=True)
+        result = subprocess.run(["pycaps", "render", "--input", video_senza_testo, "--template", "hype", "--output", final_video], capture_output=True, text=True)
+        if result.returncode != 0:
+            write_log(f"[PyCaps] Errore esecuzione pycaps. Return code: {result.returncode}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+            shutil.copy2(video_senza_testo, final_video)
     except Exception as e:
+        write_log(f"[PyCaps] Eccezione invocazione pycaps: {e}")
         shutil.copy2(video_senza_testo, final_video)
     
     if r2_mode:
