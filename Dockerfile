@@ -43,5 +43,5 @@ RUN mkdir -p /runpod-volume/barberpro/models/whisper \
 # Copia l'intero worker (incluso handler.py e requisiti)
 COPY . .
 
-# Avvia l'handler serverless di RunPod
-CMD ["python", "-u", "handler.py"]
+# Avvia l'handler serverless di RunPod (se esiste il venv di rete usa quello, altrimenti usa sistema)
+CMD ["/bin/bash", "-c", "if [ -f /runpod-volume/barberpro/venv/bin/python ]; then exec /runpod-volume/barberpro/venv/bin/python -u handler.py; else exec python -u handler.py; fi"]
