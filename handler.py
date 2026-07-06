@@ -24,98 +24,115 @@ write_log(f"Worker process started with args: {sys.argv}")
 worker_operativo = False
 messaggio_avaria = ""
 
-try:
-    write_log("Importing subprocess")
-    import subprocess
-    import os
-    write_log("Importing requests")
-    import requests
-    import json
-    import numpy as np
-    import shutil
-    import time
-    import base64
-    import urllib.request
-    import urllib.parse
-    import concurrent.futures
-    import random
-    import threading
+import subprocess
+import requests
+import json
+import numpy as np
+import shutil
+import base64
+import urllib.request
+import urllib.parse
+import concurrent.futures
+import random
+import threading
+import string
 
-    # ==========================================
-    # CONFIGURAZIONE PERCORSI E MODELLI
-    # ==========================================
-    NETWORK_VOL_DIR = "/runpod-volume/barberpro/models"
-    WHISPER_MODEL_DIR = os.path.join(NETWORK_VOL_DIR, "whisper")
-    LLM_DIR = os.path.join(NETWORK_VOL_DIR, "llm")
-    YOLO_MODEL_DIR = os.path.join(NETWORK_VOL_DIR, "yolo")
-    YOLO_PATH = os.path.join(YOLO_MODEL_DIR, "yolov8n.pt")
+# ==========================================
+# CONFIGURAZIONE PERCORSI E MODELLI
+# ==========================================
+NETWORK_VOL_DIR = "/runpod-volume/barberpro/models"
+WHISPER_MODEL_DIR = os.path.join(NETWORK_VOL_DIR, "whisper")
+LLM_DIR = os.path.join(NETWORK_VOL_DIR, "llm")
+YOLO_MODEL_DIR = os.path.join(NETWORK_VOL_DIR, "yolo")
+YOLO_PATH = os.path.join(YOLO_MODEL_DIR, "yolov8n.pt")
 
-    COMFYUI_DIR = "/runpod-volume/runpod-slim/ComfyUI"
-    PYTHON_EXECUTABLE = "python"
-    COMFYUI_PORT = "8188"
-    COMFYUI_URL = f"http://127.0.0.1:{COMFYUI_PORT}"
+COMFYUI_DIR = "/runpod-volume/runpod-slim/ComfyUI"
+PYTHON_EXECUTABLE = "python"
+COMFYUI_PORT = "8188"
+COMFYUI_URL = f"http://127.0.0.1:{COMFYUI_PORT}"
 
+models_cache = {
+    "whisper": None,
+    "yolo": None,
+    "llm": None
+}
+
+def load_ml_libraries():
+    global VideoFileClip, concatenate_videoclips, CompositeVideoClip, ImageClip, vfx
+    global WhisperModel, torch, pipeline, YOLO, Image
+    if 'torch' not in globals():
+        write_log("Loading heavy ML libraries (torch, transformers, moviepy, etc)...")
+        from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, ImageClip, vfx
+        from faster_whisper import WhisperModel
+        import torch
+        from transformers import pipeline
+        from ultralytics import YOLO
+        from PIL import Image
+        
+        globals()['VideoFileClip'] = VideoFileClip
+        globals()['concatenate_videoclips'] = concatenate_videoclips
+        globals()['CompositeVideoClip'] = CompositeVideoClip
+        globals()['ImageClip'] = ImageClip
+        globals()['vfx'] = vfx
+        globals()['WhisperModel'] = WhisperModel
+        globals()['torch'] = torch
+        globals()['pipeline'] = pipeline
+        globals()['YOLO'] = YOLO
+        globals()['Image'] = Image
+        write_log("Heavy ML libraries loaded successfully.")
+
+def start_comfyui():
+    global worker_operativo, messaggio_avaria
+    write_log("Avvio procedura ComfyUI...")
+    
+    # Check volume con leggera tolleranza per attacco rete RunPod
+    if not os.path.exists(COMFYUI_DIR):
+        for _ in range(10):
+            time.sleep(1)
+            if os.path.exists(COMFYUI_DIR):
+                break
+                
+    if not os.path.exists(COMFYUI_DIR):
+        messaggio_avaria = f"Volume di rete assente in {COMFYUI_DIR}."
+        write_log(messaggio_avaria)
+        return False
+        
     os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
     os.makedirs(LLM_DIR, exist_ok=True)
-
-    models_cache = {
-        "whisper": None,
-        "yolo": None,
-        "llm": None
-    }
-
-    write_log("Importing moviepy")
-    from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, ImageClip, vfx
-    write_log("Importing faster_whisper")
-    from faster_whisper import WhisperModel
-    write_log("Importing torch")
-    import torch
-    write_log("Importing transformers")
-    from transformers import pipeline
-    write_log("Importing ultralytics")
-    from ultralytics import YOLO
-    write_log("Importing PIL")
-    from PIL import Image
     
-    # Avviamo ComfyUI in background
-    write_log(f"Avvio ComfyUI process in {COMFYUI_DIR}")
-    print(f"Avvio ComfyUI dalla cartella: {COMFYUI_DIR}...")
     log_file_path = "/tmp/comfyui_startup.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
     cmd = [PYTHON_EXECUTABLE, "main.py", "--listen", "127.0.0.1", "--port", COMFYUI_PORT]
-    process = subprocess.Popen(cmd, cwd=COMFYUI_DIR, stdout=log_file, stderr=subprocess.STDOUT)
+    
+    try:
+        process = subprocess.Popen(cmd, cwd=COMFYUI_DIR, stdout=log_file, stderr=subprocess.STDOUT)
+    except Exception as e:
+        messaggio_avaria = f"Errore nell'avvio del processo ComfyUI: {str(e)}"
+        write_log(messaggio_avaria)
+        return False
 
-    print("In attesa dell'avvio di ComfyUI locale (Timeout 120s)...")
-    comfyui_ready = False
+    write_log("In attesa dell'avvio di ComfyUI locale (Timeout 120s)...")
     for _ in range(120):
         if process.poll() is not None:
             log_file.close()
             with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
                 error_log = f.read()
-            raise RuntimeError(f"ComfyUI si è schiantato in fase di avvio.\n\n=== INIZIO LOG INTEGRALE ===\n{error_log}\n=== FINE LOG INTEGRALE ===")
+            messaggio_avaria = f"ComfyUI si è schiantato in fase di avvio.\n=== LOG ===\n{error_log}"
+            write_log(messaggio_avaria)
+            return False
 
         try:
-            write_log("Polling ComfyUI /system_stats")
             response = requests.get(f"{COMFYUI_URL}/system_stats", timeout=1)
             if response.status_code == 200:
-                write_log("ComfyUI system_stats OK 200")
-                print("ComfyUI operativo e pronto a elaborare.")
-                comfyui_ready = True
-                break
+                write_log("ComfyUI operativo e pronto a elaborare.")
+                return True
         except requests.exceptions.RequestException:
             pass
         time.sleep(1)
         
-    if not comfyui_ready:
-        write_log("CRITICAL TIMEOUT: ComfyUI failed to respond")
-        raise RuntimeError("TIMEOUT CRITICO: ComfyUI non ha risposto entro 120s.")
-        
-    write_log("Init success, worker_operativo = True")
-    worker_operativo = True
-except Exception as e:
-    messaggio_avaria = f"Avaria avvio Worker: {str(e)}\n{traceback.format_exc()}"
-    write_log(f"Exception during init: {messaggio_avaria}")
-    print(f"ERRORE CRITICO INTERCETTATO:\n{messaggio_avaria}")
+    messaggio_avaria = "TIMEOUT CRITICO: ComfyUI non ha risposto entro 120s."
+    write_log(messaggio_avaria)
+    return False
 
 # ==========================================
 # FUNZIONI DI SUPPORTO COMFYUI E API
@@ -524,12 +541,9 @@ def chiama_regista_locale(testo_narrativo):
                   if isinstance(data[key], list):
                        data = data[key]
                        break
-        del models_cache["llm"]
-        models_cache["llm"] = None
-        torch.cuda.empty_cache()
+        # LLM tenuto in cache per lo sceneggiatore!
         return data
     except Exception:
-        torch.cuda.empty_cache()
         return []
 
 def invia_webhook_errore(url, msg):
@@ -578,6 +592,43 @@ def subagent_sceneggiatore(scena, testo_narrativo):
         torch.cuda.empty_cache()
         return prompt_enh
 
+def subagent_pulizia(modello_da_liberare=None, file_da_eliminare=None, pulizia_comfyui=False):
+    import gc
+    write_log(f"Subagent Pulizia: Modello={modello_da_liberare}, File={file_da_eliminare}, Comfy={pulizia_comfyui}")
+    
+    if modello_da_liberare and modello_da_liberare in models_cache:
+        models_cache[modello_da_liberare] = None
+        
+    if 'torch' in globals():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    if file_da_eliminare:
+        if isinstance(file_da_eliminare, list):
+            for f in file_da_eliminare:
+                if os.path.exists(f):
+                    try:
+                        if os.path.isdir(f): shutil.rmtree(f, ignore_errors=True)
+                        else: os.unlink(f)
+                    except: pass
+        elif os.path.exists(file_da_eliminare):
+            try:
+                if os.path.isdir(file_da_eliminare): shutil.rmtree(file_da_eliminare, ignore_errors=True)
+                else: os.unlink(file_da_eliminare)
+            except: pass
+
+    if pulizia_comfyui:
+        comfy_out = os.path.join(COMFYUI_DIR, "output")
+        comfy_in = os.path.join(COMFYUI_DIR, "input")
+        for folder in [comfy_out, comfy_in]:
+            if os.path.exists(folder):
+                for f in os.listdir(folder):
+                    try:
+                        file_path = os.path.join(folder, f)
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                    except: pass
+
 def process_video_workflow(job_input, job_id="default"):
     workspace = f"/tmp/runpod_workspace_{job_id}"
     os.makedirs(workspace, exist_ok=True)
@@ -604,43 +655,45 @@ def process_video_workflow(job_input, job_id="default"):
             for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
             
     taglia_silenzi_ffmpeg(raw_video, cut_video)
-    applica_smart_auto_reframe(cut_video, framed_video, target_w=1080, target_h=1920)
+    subagent_pulizia(file_da_eliminare=raw_video)
     
-    if models_cache.get("yolo"):
-        del models_cache["yolo"]
-        models_cache["yolo"] = None
-        torch.cuda.empty_cache()
+    applica_smart_auto_reframe(cut_video, framed_video, target_w=1080, target_h=1920)
+    subagent_pulizia(modello_da_liberare="yolo", file_da_eliminare=cut_video)
     
     testo_narrativo, word_list = trascrizione_whisper(framed_video)
-    if models_cache.get("whisper"):
-        del models_cache["whisper"]
-        models_cache["whisper"] = None
-        torch.cuda.empty_cache()
+    subagent_pulizia(modello_da_liberare="whisper")
     
     scene_json = chiama_regista_locale(testo_narrativo)
+    scene_elaborate = scene_json.copy()
     
-    # Esecuzione Subagents in parallelo
+    # Eseguo lo sceneggiatore IN SERIE per tutte le scene per isolare l'uso VRAM dell'LLM
+    for scena in scene_elaborate:
+        azione = scena.get("azione", "null")
+        idea = scena.get("idea_grezza", "")
+        if azione != "null" and idea:
+            write_log(f"[Sceneggiatore] Analizzo l'idea '{idea}'...")
+            scena["prompt"] = subagent_sceneggiatore(scena, testo_narrativo)
+            write_log(f"[Sceneggiatore -> Regista] Prompt potenziato: {scena['prompt']}")
+            
+    # ORA LIBERO COMPLETAMENTE LLM PRIMA DI AVVIARE I THREAD DI COMFYUI
+    subagent_pulizia(modello_da_liberare="llm")
+    
+    # Esecuzione Subagents Generativi in parallelo
     asset_dir = os.path.join(workspace, "assets")
     os.makedirs(asset_dir, exist_ok=True)
     
-    scene_elaborate = scene_json.copy()
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures_map = {}
         for idx, scena in enumerate(scene_elaborate):
             azione = scena.get("azione", "null")
-            idea = scena.get("idea_grezza", "")
-            if azione != "null" and idea:
-                # Il worker eseguirà prima lo sceneggiatore, poi l'immagine/video
-                def task_completo(s, d):
-                    print(f"[Sceneggiatore] Analizzo l'idea '{s.get('idea_grezza')}'...")
-                    s["prompt"] = subagent_sceneggiatore(s, testo_narrativo)
-                    print(f"[Sceneggiatore -> Regista] Prompt potenziato: {s['prompt']}")
+            if azione != "null" and scena.get("prompt"):
+                def task_generativo(s, d):
                     if s["azione"].startswith("video_"):
                         return subagent_video_chain(s, d)
                     else:
                         return subagent_comfyui_worker(s, d)
                         
-                futures_map[executor.submit(task_completo, scena, asset_dir)] = idx
+                futures_map[executor.submit(task_generativo, scena, asset_dir)] = idx
             
         for future in concurrent.futures.as_completed(futures_map):
             idx = futures_map[future]
@@ -737,27 +790,15 @@ def process_video_workflow(job_input, job_id="default"):
         with open(final_video, 'rb') as f:
             requests.post(webhook_url, files={'file': f}, headers={"User-Agent": "Mozilla/5.0"})
             
-    # Pulizia workspace locale del container
-    shutil.rmtree(workspace, ignore_errors=True)
-    
-    # Pulizia forzata delle cache persistenti di ComfyUI sul Network Volume
-    comfy_out = os.path.join(COMFYUI_DIR, "output")
-    comfy_in = os.path.join(COMFYUI_DIR, "input")
-    for folder in [comfy_out, comfy_in]:
-        if os.path.exists(folder):
-            for f in os.listdir(folder):
-                file_path = os.path.join(folder, f)
-                try:
-                    if os.path.isfile(file_path):
-                        os.unlink(file_path)
-                except Exception:
-                    pass
+    # Pulizia globale finale: svuota VRAM, elimina workspace e pulisce cache ComfyUI
+    subagent_pulizia(file_da_eliminare=workspace, pulizia_comfyui=True)
                     
     return {"status": "success", "message": "Reel generato con successo!", "r2_mode": r2_mode}
 
 def handler(job):
     write_log(f"handler invoked with job: {job.get('id', 'default')}")
     try:
+        load_ml_libraries()
         return process_video_workflow(job['input'], job.get("id", "default"))
     except Exception as e:
         stack = traceback.format_exc()
@@ -774,9 +815,22 @@ def safe_handler(job):
     if not worker_operativo:
         write_log("Rifiuto job per worker_operativo == False")
         invia_webhook_errore(job.get("input", {}).get("webhookUrl"), f"Worker in avaria al boot:\n{messaggio_avaria}")
-        return {"status": "error_handled_standby", "error": "Worker in avaria al boot", "dettagli": messaggio_avaria}
+        return {"status": "error_handled_standby", "message": "Worker in avaria al boot", "dettagli": messaggio_avaria}
     return handler(job)
 
-write_log("calling runpod.serverless.start")
-runpod.serverless.start({"handler": safe_handler})
-write_log("runpod.serverless.start returned (worker exiting)")
+if __name__ == "__main__":
+    try:
+        if start_comfyui():
+            worker_operativo = True
+            write_log("Init success, worker_operativo = True")
+        else:
+            worker_operativo = False
+            write_log(f"Init failed, worker_operativo = False. Dettagli: {messaggio_avaria}")
+    except Exception as e:
+        messaggio_avaria = f"Avaria imprevista avvio Worker: {str(e)}\n{traceback.format_exc()}"
+        write_log(f"Exception during init: {messaggio_avaria}")
+        worker_operativo = False
+
+    write_log("calling runpod.serverless.start")
+    runpod.serverless.start({"handler": safe_handler})
+    write_log("runpod.serverless.start returned (worker exiting)")
