@@ -101,9 +101,13 @@ def start_comfyui():
     os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
     os.makedirs(LLM_DIR, exist_ok=True)
     
+    # Valuta l'eseguibile Python DOPO aver atteso il mount del volume di rete
+    venv_python = "/runpod-volume/barberpro/venv/bin/python"
+    comfyui_python = venv_python if os.path.exists(venv_python) else sys.executable
+    
     log_file_path = "/tmp/comfyui_startup.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
-    cmd = [PYTHON_EXECUTABLE, "main.py", "--listen", "127.0.0.1", "--port", COMFYUI_PORT]
+    cmd = [comfyui_python, "main.py", "--listen", "127.0.0.1", "--port", COMFYUI_PORT]
     
     try:
         process = subprocess.Popen(cmd, cwd=COMFYUI_DIR, stdout=log_file, stderr=subprocess.STDOUT)
