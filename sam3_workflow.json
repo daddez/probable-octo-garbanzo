@@ -1,0 +1,20 @@
+{
+  "2": {"inputs": {"image": "FILENAME"}, "class_type": "LoadImage"},
+  "77": {"inputs": {"ckpt_name": "sam3.1_multiplex_fp16.safetensors"}, "class_type": "CheckpointLoaderSimple"},
+  "78": {"inputs": {"text": "SUBJECT_PROMPT", "clip": ["77", 1]}, "class_type": "CLIPTextEncode"},
+  "75": {
+      "inputs": {
+          "model": ["77", 0],
+          "image": ["2", 0],
+          "conditioning": ["78", 0],
+          "threshold": 0.5,
+          "refine_iterations": 2,
+          "individual_masks": false,
+          "positive_coords": "",
+          "negative_coords": ""
+      },
+      "class_type": "SAM3_Detect"
+  },
+  "100": {"inputs": {"image": ["2", 0], "alpha": ["75", 0]}, "class_type": "JoinImageWithAlpha"},
+  "3": {"inputs": {"filename_prefix": "ComfyUI_RMBG", "images": ["100", 0]}, "class_type": "SaveImage"}
+}
