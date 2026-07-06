@@ -1,0 +1,14 @@
+runpod>=1.6.2
+requests==2.31.0
+moviepy==1.0.3
+faster-whisper>=1.0.0
+transformers==4.44.2
+huggingface-hub==0.24.6
+ultralytics==8.2.98
+sentencepiece==0.2.0
+imageio-ffmpeg==0.5.1
+opencv-python-headless==4.10.0.84
+pycaps[base] @ git+https://github.com/francozanardi/pycaps.git
+sqlalchemy
+numpy<2.0.0
+langgraph
