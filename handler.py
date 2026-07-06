@@ -2,15 +2,33 @@ import runpod
 import traceback
 import sys
 import faulthandler
+import os
+import time
+from datetime import datetime
 
 faulthandler.enable()
+
+LOG_DIR = "/runpod-volume/barberpro/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S_") + str(int(time.time() * 1000))
+LOG_FILE = os.path.join(LOG_DIR, f"worker_{SESSION_ID}.log")
+
+def write_log(msg: str):
+    timestamp = datetime.now().isoformat()
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {msg}\n")
+    print(f"[{timestamp}] {msg}", flush=True)
+
+write_log(f"Worker process started with args: {sys.argv}")
 
 worker_operativo = False
 messaggio_avaria = ""
 
 try:
+    write_log("Importing subprocess")
     import subprocess
     import os
+    write_log("Importing requests")
     import requests
     import json
     import numpy as np
@@ -19,10 +37,9 @@ try:
     import base64
     import urllib.request
     import urllib.parse
+    import concurrent.futures
     import random
     import threading
-    from typing import TypedDict, List, Dict, Any
-    from langgraph.graph import StateGraph, START, END
 
     # ==========================================
     # CONFIGURAZIONE PERCORSI E MODELLI
@@ -47,14 +64,21 @@ try:
         "llm": None
     }
 
+    write_log("Importing moviepy")
     from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, ImageClip, vfx
+    write_log("Importing faster_whisper")
     from faster_whisper import WhisperModel
+    write_log("Importing torch")
     import torch
+    write_log("Importing transformers")
     from transformers import pipeline
+    write_log("Importing ultralytics")
     from ultralytics import YOLO
+    write_log("Importing PIL")
     from PIL import Image
     
     # Avviamo ComfyUI in background
+    write_log(f"Avvio ComfyUI process in {COMFYUI_DIR}")
     print(f"Avvio ComfyUI dalla cartella: {COMFYUI_DIR}...")
     log_file_path = "/tmp/comfyui_startup.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
@@ -71,8 +95,10 @@ try:
             raise RuntimeError(f"ComfyUI si è schiantato in fase di avvio.\n\n=== INIZIO LOG INTEGRALE ===\n{error_log}\n=== FINE LOG INTEGRALE ===")
 
         try:
+            write_log("Polling ComfyUI /system_stats")
             response = requests.get(f"{COMFYUI_URL}/system_stats", timeout=1)
             if response.status_code == 200:
+                write_log("ComfyUI system_stats OK 200")
                 print("ComfyUI operativo e pronto a elaborare.")
                 comfyui_ready = True
                 break
@@ -81,39 +107,76 @@ try:
         time.sleep(1)
         
     if not comfyui_ready:
+        write_log("CRITICAL TIMEOUT: ComfyUI failed to respond")
         raise RuntimeError("TIMEOUT CRITICO: ComfyUI non ha risposto entro 120s.")
         
+    write_log("Init success, worker_operativo = True")
     worker_operativo = True
 except Exception as e:
     messaggio_avaria = f"Avaria avvio Worker: {str(e)}\n{traceback.format_exc()}"
+    write_log(f"Exception during init: {messaggio_avaria}")
     print(f"ERRORE CRITICO INTERCETTATO:\n{messaggio_avaria}")
 
 # ==========================================
 # FUNZIONI DI SUPPORTO COMFYUI E API
 # ==========================================
 def get_flux_workflow(prompt):
-    with open(os.path.join(os.path.dirname(__file__), "text_to_image_workflow.json"), "r") as f:
-        workflow = json.load(f)
-    workflow["6"]["inputs"]["text"] = prompt
-    workflow["25"]["inputs"]["noise_seed"] = random.randint(1, 10000000)
-    return workflow
+    return {
+      "6": {"inputs": {"text": prompt,"clip": ["38",0]},"class_type": "CLIPTextEncode"},
+      "8": {"inputs": {"samples": ["13",0],"vae": ["10",0]},"class_type": "VAEDecode"},
+      "9": {"inputs": {"filename_prefix": "ComfyUI","images": ["8",0]},"class_type": "SaveImage"},
+      "10": {"inputs": {"vae_name": "full_encoder_small_decoder.safetensors"},"class_type": "VAELoader"},
+      "12": {"inputs": {"unet_name": "flux2_dev_fp8mixed.safetensors","weight_dtype": "default"},"class_type": "UNETLoader"},
+      "13": {"inputs": {"noise": ["25",0],"guider": ["22",0],"sampler": ["16",0],"sigmas": ["48",0],"latent_image": ["47",0]},"class_type": "SamplerCustomAdvanced"},
+      "16": {"inputs": {"sampler_name": "euler"},"class_type": "KSamplerSelect"},
+      "22": {"inputs": {"model": ["12",0],"conditioning": ["26",0]},"class_type": "BasicGuider"},
+      "25": {"inputs": {"noise_seed": random.randint(1, 10000000)},"class_type": "RandomNoise"},
+      "26": {"inputs": {"guidance": 4,"conditioning": ["6",0]},"class_type": "FluxGuidance"},
+      "38": {"inputs": {"clip_name": "mistral_3_small_flux2_bf16.safetensors","type": "flux2","device": "default"},"class_type": "CLIPLoader"},
+      "47": {"inputs": {"width": 720,"height": 1280,"batch_size": 1},"class_type": "EmptyFlux2LatentImage"},
+      "48": {"inputs": {"steps": 20,"width": 720,"height": 1280},"class_type": "Flux2Scheduler"}
+    }
 
 def get_rmbg_workflow(filename, subject_prompt="character"):
-    with open(os.path.join(os.path.dirname(__file__), "sam3_workflow.json"), "r") as f:
-        workflow = json.load(f)
-    workflow["2"]["inputs"]["image"] = filename
-    workflow["78"]["inputs"]["text"] = subject_prompt
-    return workflow
+    return {
+      "2": {"inputs": {"image": filename}, "class_type": "LoadImage"},
+      "77": {"inputs": {"ckpt_name": "sam3.1_multiplex_fp16.safetensors"}, "class_type": "CheckpointLoaderSimple"},
+      "78": {"inputs": {"text": subject_prompt, "clip": ["77", 1]}, "class_type": "CLIPTextEncode"},
+      "75": {
+          "inputs": {
+              "model": ["77", 0],
+              "image": ["2", 0],
+              "conditioning": ["78", 0],
+              "threshold": 0.5,
+              "refine_iterations": 2,
+              "individual_masks": False,
+              "positive_coords": "",
+              "negative_coords": ""
+          },
+          "class_type": "SAM3_Detect"
+      },
+      "100": {"inputs": {"image": ["2", 0], "alpha": ["75", 0]}, "class_type": "JoinImageWithAlpha"},
+      "3": {"inputs": {"filename_prefix": "ComfyUI_RMBG", "images": ["100", 0]}, "class_type": "SaveImage"}
+    }
 
 def get_wan2_i2v_workflow(image_filename, prompt):
-    with open(os.path.join(os.path.dirname(__file__), "image_to_video_workflow.json"), "r") as f:
-        workflow = json.load(f)
-    workflow["97"]["inputs"]["image"] = image_filename
-    workflow["93"]["inputs"]["text"] = prompt
-    seed = random.randint(1, 10000000)
-    workflow["86"]["inputs"]["noise_seed"] = seed
-    workflow["85"]["inputs"]["noise_seed"] = seed
-    return workflow
+    return {
+      "97": {"inputs": {"image": image_filename},"class_type": "LoadImage"},
+      "84": {"inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"},"class_type": "CLIPLoader"},
+      "90": {"inputs": {"vae_name": "wan_2.1_vae.safetensors"},"class_type": "VAELoader"},
+      "89": {"inputs": {"text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走", "clip": ["84", 0]},"class_type": "CLIPTextEncode"},
+      "93": {"inputs": {"text": prompt, "clip": ["84", 0]},"class_type": "CLIPTextEncode"},
+      "98": {"inputs": {"width": 640, "height": 640, "length": 81, "positive": ["93", 0], "negative": ["89", 0], "vae": ["90", 0], "start_image": ["97", 0]},"class_type": "WanImageToVideo"},
+      "96": {"inputs": {"unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"},"class_type": "UNETLoader"},
+      "95": {"inputs": {"unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"},"class_type": "UNETLoader"},
+      "104": {"inputs": {"shift": 5.0, "model": ["96", 0]},"class_type": "ModelSamplingSD3"},
+      "103": {"inputs": {"shift": 5.0, "model": ["95", 0]},"class_type": "ModelSamplingSD3"},
+      "86": {"inputs": {"add_noise": "enable", "noise_seed": random.randint(1, 10000000), "steps": 20, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": 10, "return_with_leftover_noise": "enable", "model": ["104", 0], "positive": ["98", 0], "negative": ["98", 1], "latent_image": ["98", 2]},"class_type": "KSamplerAdvanced"},
+      "85": {"inputs": {"add_noise": "disable", "noise_seed": random.randint(1, 10000000), "steps": 20, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 10, "end_at_step": 20, "return_with_leftover_noise": "disable", "model": ["103", 0], "positive": ["98", 0], "negative": ["98", 1], "latent_image": ["86", 0]},"class_type": "KSamplerAdvanced"},
+      "87": {"inputs": {"samples": ["85", 0], "vae": ["90", 0]},"class_type": "VAEDecode"},
+      "94": {"inputs": {"fps": 16, "images": ["87", 0]},"class_type": "CreateVideo"},
+      "108": {"inputs": {"filename_prefix": "Wan2_i2v", "video": ["94", 0]},"class_type": "SaveVideo"}
+    }
 
 def upload_image_to_comfy(filepath):
     with open(filepath, "rb") as f:
@@ -515,40 +578,13 @@ def subagent_sceneggiatore(scena, testo_narrativo):
         torch.cuda.empty_cache()
         return prompt_enh
 
-class AgentState(TypedDict):
-    job_input: dict
-    job_id: str
-    workspace: str
-    raw_video: str
-    cut_video: str
-    framed_video: str
-    final_video: str
-    asset_dir: str
-    testo_narrativo: str
-    word_list: list
-    scene_elaborate: list
-    current_scene_idx: int
-    r2_mode: bool
-    webhook_url: str
-    r2_download_url: str
-    r2_upload_url: str
-    r2_upload_key: str
-    r2_raw_key: str
-    video_url: str
-    error: str
-    status: str
-
-def init_node(state: AgentState):
-    job_input = state["job_input"]
-    job_id = state["job_id"]
+def process_video_workflow(job_input, job_id="default"):
     workspace = f"/tmp/runpod_workspace_{job_id}"
     os.makedirs(workspace, exist_ok=True)
     raw_video = os.path.join(workspace, "raw.mp4")
     cut_video = os.path.join(workspace, "cut.mp4")
     framed_video = os.path.join(workspace, "framed.mp4")
     final_video = os.path.join(workspace, "final.mp4")
-    asset_dir = os.path.join(workspace, "assets")
-    os.makedirs(asset_dir, exist_ok=True)
     
     r2_download_url = job_input.get("r2DownloadUrl")
     r2_upload_url = job_input.get("r2UploadUrl")
@@ -560,11 +596,11 @@ def init_node(state: AgentState):
     
     if r2_mode:
         r = requests.get(r2_download_url, stream=True, headers={"User-Agent": "Mozilla/5.0"})
-        with open(raw_video, "wb") as f:
+        with open(raw_video, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
     else:
         r = requests.get(video_url, stream=True, headers={"User-Agent": "Mozilla/5.0"})
-        with open(raw_video, "wb") as f:
+        with open(raw_video, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
             
     taglia_silenzi_ffmpeg(raw_video, cut_video)
@@ -580,70 +616,62 @@ def init_node(state: AgentState):
         del models_cache["whisper"]
         models_cache["whisper"] = None
         torch.cuda.empty_cache()
-
-    return {
-        "workspace": workspace,
-        "raw_video": raw_video,
-        "cut_video": cut_video,
-        "framed_video": framed_video,
-        "final_video": final_video,
-        "asset_dir": asset_dir,
-        "testo_narrativo": testo_narrativo,
-        "word_list": word_list,
-        "r2_mode": r2_mode,
-        "r2_upload_url": r2_upload_url,
-        "r2_upload_key": r2_upload_key,
-        "r2_raw_key": r2_raw_key,
-        "webhook_url": webhook_url
-    }
-
-def regista_node(state: AgentState):
-    scene_json = chiama_regista_locale(state["testo_narrativo"])
-    return {"scene_elaborate": scene_json, "current_scene_idx": 0}
-
-def sceneggiatore_visual_node(state: AgentState):
-    idx = state["current_scene_idx"]
-    scene_elaborate = list(state["scene_elaborate"])
-    scena = scene_elaborate[idx]
     
-    azione = scena.get("azione", "null")
-    idea = scena.get("idea_grezza", "")
+    scene_json = chiama_regista_locale(testo_narrativo)
     
-    if azione != "null" and idea:
-        print(f"[LangGraph] Sceneggiatore analizza scena {idx}...")
-        scena["prompt"] = subagent_sceneggiatore(scena, state["testo_narrativo"])
-        
-        print(f"[LangGraph] Generazione visiva per scena {idx}...")
-        if azione.startswith("video_"):
-            res = subagent_video_chain(scena, state["asset_dir"])
-        else:
-            res = subagent_comfyui_worker(scena, state["asset_dir"])
-            if isinstance(res, str) and scena.get("rimuovi_sfondo"):
-                soggetto = scena.get("soggetto_da_isolare", "character")
-                res = subagent_comfyui_rmbg(res, state["asset_dir"], subject_prompt=soggetto)
-                
-        if isinstance(res, dict) and "error" in res:
-            return {"error": res["error"]}
-        else:
-            scena["asset_path"] = res
+    # Esecuzione Subagents in parallelo
+    asset_dir = os.path.join(workspace, "assets")
+    os.makedirs(asset_dir, exist_ok=True)
+    
+    scene_elaborate = scene_json.copy()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures_map = {}
+        for idx, scena in enumerate(scene_elaborate):
+            azione = scena.get("azione", "null")
+            idea = scena.get("idea_grezza", "")
+            if azione != "null" and idea:
+                # Il worker eseguirà prima lo sceneggiatore, poi l'immagine/video
+                def task_completo(s, d):
+                    print(f"[Sceneggiatore] Analizzo l'idea '{s.get('idea_grezza')}'...")
+                    s["prompt"] = subagent_sceneggiatore(s, testo_narrativo)
+                    print(f"[Sceneggiatore -> Regista] Prompt potenziato: {s['prompt']}")
+                    if s["azione"].startswith("video_"):
+                        return subagent_video_chain(s, d)
+                    else:
+                        return subagent_comfyui_worker(s, d)
+                        
+                futures_map[executor.submit(task_completo, scena, asset_dir)] = idx
             
-    scene_elaborate[idx] = scena
-    return {"scene_elaborate": scene_elaborate, "current_scene_idx": idx + 1}
+        for future in concurrent.futures.as_completed(futures_map):
+            idx = futures_map[future]
+            res = future.result()
+            if isinstance(res, dict) and "error" in res:
+                err_msg = f"Avaria Subagent Generativo! Tentativi esauriti: {res['error']}"
+                invia_webhook_errore(webhook_url, err_msg)
+                print(err_msg + " -> Vado in standby morbido.")
+                shutil.rmtree(workspace, ignore_errors=True)
+                return {"status": "error_handled_standby", "message": "Avaria gestita con standby per evitare riavvii di RunPod."}
+            else:
+                scena = scene_elaborate[idx]
+                azione = scena.get("azione", "")
+                
+                # Se era un'immagine pura e serviva rimozione sfondo
+                if azione.startswith("immagine_") and scena.get("rimuovi_sfondo"):
+                    soggetto = scena.get("soggetto_da_isolare", "character")
+                    print(f"Rimozione sfondo richiesta per l'asset {idx} sul soggetto '{soggetto}'...")
+                    rmbg_res = subagent_comfyui_rmbg(res, asset_dir, subject_prompt=soggetto)
+                    if isinstance(rmbg_res, dict) and "error" in rmbg_res:
+                        err_msg = f"Avaria Subagent RMBG! Tentativi esauriti: {rmbg_res['error']}"
+                        invia_webhook_errore(webhook_url, err_msg)
+                        print(err_msg + " -> Vado in standby morbido.")
+                        shutil.rmtree(workspace, ignore_errors=True)
+                        return {"status": "error_handled_standby", "message": "Avaria RMBG gestita con standby."}
+                    else:
+                        scene_elaborate[idx]["asset_path"] = rmbg_res
+                else:
+                    scene_elaborate[idx]["asset_path"] = res
 
-def router_scenes(state: AgentState):
-    if state.get("error"):
-        return "error_node"
-    if state["current_scene_idx"] < len(state["scene_elaborate"]):
-        return "sceneggiatore_visual_node"
-    return "compositing_node"
-
-def compositing_node(state: AgentState):
-    workspace = state["workspace"]
-    framed_video = state["framed_video"]
-    scene_elaborate = state["scene_elaborate"]
-    word_list = state["word_list"]
-    final_video = state["final_video"]
-    
+    # Compositing Finale
     video_base = VideoFileClip(framed_video)
     fallback_durata = video_base.duration / max(1, len(scene_elaborate))
     elementi_da_sovrapporre = [video_base]
@@ -665,17 +693,28 @@ def compositing_node(state: AgentState):
             try:
                 if is_video_file or azione.startswith("video_"):
                     clip = VideoFileClip(scena["asset_path"])
+                    # Se il video generato è più corto della durata richiesta dalla scena, lo mandiamo in loop
                     if clip.duration < durata_scena:
                         clip = clip.fx(vfx.loop, duration=durata_scena)
                     else:
                         clip = clip.set_duration(durata_scena)
                         
-                    clip = (clip.set_start(start_time).resize(width=1000).set_position(("center", "center")).crossfadein(0.5).crossfadeout(0.5))
+                    clip = (clip.set_start(start_time)
+                            .resize(width=1000)
+                            .set_position(("center", "center"))
+                            .crossfadein(0.5)
+                            .crossfadeout(0.5))
                 else:
-                    clip = (ImageClip(scena["asset_path"]).set_duration(durata_scena).set_start(start_time).resize(width=1000).set_position(("center", "center")).crossfadein(0.5).crossfadeout(0.5))
+                    clip = (ImageClip(scena["asset_path"])
+                            .set_duration(durata_scena)
+                            .set_start(start_time)
+                            .resize(width=1000)
+                            .set_position(("center", "center"))
+                            .crossfadein(0.5)
+                            .crossfadeout(0.5))
                 elementi_da_sovrapporre.append(clip)
             except Exception:
-                pass
+                pass # Fallback in caso di corruzione video
             
     clip_composta = CompositeVideoClip(elementi_da_sovrapporre, size=(1080, 1920))
     video_senza_testo = os.path.join(workspace, "composited_no_subs.mp4")
@@ -689,17 +728,19 @@ def compositing_node(state: AgentState):
     except Exception as e:
         shutil.copy2(video_senza_testo, final_video)
     
-    if state["r2_mode"]:
+    if r2_mode:
         file_size = os.path.getsize(final_video)
-        with open(final_video, "rb") as f:
-            requests.put(state["r2_upload_url"], data=f, headers={"Content-Type": "video/mp4", "Content-Length": str(file_size)})
-        requests.post(state["webhook_url"], json={"status": "success", "s3KeyFinal": state["r2_upload_key"], "s3KeyRaw": state["r2_raw_key"]}, headers={"User-Agent": "Mozilla/5.0"})
+        with open(final_video, 'rb') as f:
+            requests.put(r2_upload_url, data=f, headers={"Content-Type": "video/mp4", "Content-Length": str(file_size)})
+        requests.post(webhook_url, json={"status": "success", "s3KeyFinal": r2_upload_key, "s3KeyRaw": r2_raw_key}, headers={"User-Agent": "Mozilla/5.0"})
     else:
-        with open(final_video, "rb") as f:
-            requests.post(state["webhook_url"], files={"file": f}, headers={"User-Agent": "Mozilla/5.0"})
+        with open(final_video, 'rb') as f:
+            requests.post(webhook_url, files={'file': f}, headers={"User-Agent": "Mozilla/5.0"})
             
+    # Pulizia workspace locale del container
     shutil.rmtree(workspace, ignore_errors=True)
     
+    # Pulizia forzata delle cache persistenti di ComfyUI sul Network Volume
     comfy_out = os.path.join(COMFYUI_DIR, "output")
     comfy_in = os.path.join(COMFYUI_DIR, "input")
     for folder in [comfy_out, comfy_in]:
@@ -712,45 +753,10 @@ def compositing_node(state: AgentState):
                 except Exception:
                     pass
                     
-    return {"status": "success"}
-
-def error_node(state: AgentState):
-    err_msg = f"Avaria LangGraph: {state.get(error)}"
-    invia_webhook_errore(state["webhook_url"], err_msg)
-    if "workspace" in state and os.path.exists(state["workspace"]):
-        shutil.rmtree(state["workspace"], ignore_errors=True)
-    return {"status": "error_handled_standby"}
-
-def process_video_workflow(job_input, job_id="default"):
-    builder = StateGraph(AgentState)
-    builder.add_node("init_node", init_node)
-    builder.add_node("regista_node", regista_node)
-    builder.add_node("sceneggiatore_visual_node", sceneggiatore_visual_node)
-    builder.add_node("compositing_node", compositing_node)
-    builder.add_node("error_node", error_node)
-    
-    builder.add_edge(START, "init_node")
-    builder.add_edge("init_node", "regista_node")
-    builder.add_edge("regista_node", "sceneggiatore_visual_node")
-    builder.add_conditional_edges("sceneggiatore_visual_node", router_scenes)
-    builder.add_edge("compositing_node", END)
-    builder.add_edge("error_node", END)
-    
-    graph = builder.compile()
-    
-    initial_state = {
-        "job_input": job_input,
-        "job_id": job_id
-    }
-    
-    res = graph.invoke(initial_state)
-    
-    if res.get("status") == "error_handled_standby":
-        return {"status": "error_handled_standby", "message": "Avaria gestita dal router LangGraph con standby."}
-        
-    return {"status": "success", "message": "Reel generato con successo via LangGraph!", "r2_mode": res.get("r2_mode", False)}
+    return {"status": "success", "message": "Reel generato con successo!", "r2_mode": r2_mode}
 
 def handler(job):
+    write_log(f"handler invoked with job: {job.get('id', 'default')}")
     try:
         return process_video_workflow(job['input'], job.get("id", "default"))
     except Exception as e:
@@ -764,9 +770,13 @@ def handler(job):
         return {"status": "error_handled_standby", "message": str(e), "stacktrace": stack}
 
 def safe_handler(job):
+    write_log(f"safe_handler invocato per job {job.get('id', 'unknown')}")
     if not worker_operativo:
+        write_log("Rifiuto job per worker_operativo == False")
         invia_webhook_errore(job.get("input", {}).get("webhookUrl"), f"Worker in avaria al boot:\n{messaggio_avaria}")
         return {"status": "error_handled_standby", "error": "Worker in avaria al boot", "dettagli": messaggio_avaria}
     return handler(job)
 
+write_log("calling runpod.serverless.start")
 runpod.serverless.start({"handler": safe_handler})
+write_log("runpod.serverless.start returned (worker exiting)")
